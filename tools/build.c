@@ -1,88 +1,129 @@
-#if defined(__MINGW32__) && !defined(__USE_MINGW_ANSI_STDIO)
-#define __USE_MINGW_ANSI_STDIO 1
-#endif
-
-#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <linux/fs.h>
+#include <unistd.h>
 #include <fcntl.h>
-#include <io.h>
-#endif
 
-enum {
-    SECTOR_SIZE = 512,
-    SETUP_SECTORS = 4,
-    SETUP_SIZE = SECTOR_SIZE * SETUP_SECTORS
-};
+#define MINIX_HEADER 32
+#define GCC_HEADER 1024
 
-static int read_module(const char *path, unsigned char *data, size_t limit,
-                       size_t *size)
+#define SYS_SIZE 0x2000
+
+#define DEFAULT_MAJOR_ROOT 2
+#define DEFAULT_MINOR_ROOT 29
+
+#define SETUP_SECTS 4
+
+#define STRINGIFY(x) #x
+
+#define ARG_LEN 4
+
+void die(char * str)
 {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
-        return 0;
-    }
+	fprintf(stderr, "%s\n", str);
+	exit(1);
+}
 
-    *size = fread(data, 1, limit + 1, file);
-    if (ferror(file)) {
-        fprintf(stderr, "Cannot read %s: %s\n", path, strerror(errno));
-        fclose(file);
-        return 0;
-    }
-    if (fclose(file) != 0) {
-        fprintf(stderr, "Cannot close %s: %s\n", path, strerror(errno));
-        return 0;
-    }
-    if (*size == 0 || *size > limit) {
-        fprintf(stderr, "%s must contain 1 to %zu bytes.\n", path, limit);
-        return 0;
-    }
-    return 1;
+void usage(void)
+{
+	die("Usage: build bootsect setup system [rootdev] [> image]");
 }
 
 int main(int argc, char **argv)
 {
-    unsigned char bootsect[SECTOR_SIZE + 1] = {0};
-    unsigned char setup[SETUP_SIZE + 1] = {0};
-    size_t bootsect_size;
-    size_t setup_size;
+	int i, c, id;
+	char buf[1024];
+	char major_root, minor_root;
+	struct stat sb;
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s bootsect setup > linux.img\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-    if (!read_module(argv[1], bootsect, SECTOR_SIZE, &bootsect_size) ||
-        !read_module(argv[2], setup, SETUP_SIZE, &setup_size)) {
-        return EXIT_FAILURE;
-    }
-    if (bootsect_size != SECTOR_SIZE) {
-        fprintf(stderr, "bootsect must be exactly %d bytes.\n", SECTOR_SIZE);
-        return EXIT_FAILURE;
-    }
-    if (bootsect[510] != 0x55 || bootsect[511] != 0xaa) {
-        fprintf(stderr, "bootsect must end with the signature 55 AA.\n");
-        return EXIT_FAILURE;
-    }
+	if ((argc != ARG_LEN) && (argc != ARG_LEN + 1))
+		usage();
 
-#ifdef _WIN32
-    if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
-        fprintf(stderr, "Cannot use binary output: %s\n", strerror(errno));
-        return EXIT_FAILURE;
-    }
-#endif
+	if (argc == ARG_LEN + 1)
+	{
+		if (strcmp(argv[ARG_LEN], "FLOPPY"))
+		{
+			if (stat(argv[ARG_LEN], &sb))
+			{
+				perror(argv[ARG_LEN]);
+				die("Couldn't stat root device");
+			}
+			major_root = sb.st_rdev & 0xff00;
+			minor_root = sb.st_rdev & 0x00ff;
+		}
+		else
+		{
+			major_root = 0;
+			minor_root = 0;
+		}
+	}
+	else
+	{
+		major_root = DEFAULT_MAJOR_ROOT;
+		minor_root = DEFAULT_MINOR_ROOT;
+	}
+	fprintf(stderr, "Root device is (%d, %d)\n", major_root, minor_root);
+	if ((major_root != 2) && (major_root != 3) && (major_root != 0))
+	{
+		fprintf(stderr, "Illegal root device (major = %d)\n", major_root);
+		die("Bad root device --- major #");
+	}
 
-    if (fwrite(bootsect, 1, SECTOR_SIZE, stdout) != SECTOR_SIZE ||
-        fwrite(setup, 1, SETUP_SIZE, stdout) != SETUP_SIZE ||
-        fflush(stdout) != 0) {
-        fprintf(stderr, "Cannot write the complete boot image.\n");
-        return EXIT_FAILURE;
-    }
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = 0;
 
-    fprintf(stderr, "bootsect: %zu bytes; setup: %zu bytes; image: %d bytes\n",
-            bootsect_size, setup_size, SECTOR_SIZE + SETUP_SIZE);
-    return EXIT_SUCCESS;
+	if ((id = open(argv[1], O_RDONLY, 0)) < 0)
+		die("Unable to open 'boot'");
+
+	i = read(id, buf, sizeof(buf));
+	fprintf(stderr, "Boot sector %d bytes.\n", i);
+	if (i != 512)
+		die("Boot block must be exactly 512 bytes");
+
+	buf[508] = (char) minor_root;
+	buf[509] = (char) major_root;
+	i = write(1, buf, 512);
+	if (i != 512)
+		die("Write call failed");
+	close(id);
+
+	if ((id = open(argv[2], O_RDONLY, 0)) < 0)
+		die("Unable to open 'setup'");
+
+	for (i = 0; (c = read(id, buf, sizeof(buf))) > 0; i += c)
+		if (write(1, buf, c) != c)
+			die("Write call failed");
+
+	close(id);
+
+	if (i > SETUP_SECTS * 512)
+		die("Setup exceeds" STRINGIFY(SETUP_SECTS) " sectors - rewrite build/boot/setup");
+	fprintf(stderr, "Setup is %d bytes.\n", i);
+	for (c = 0; c < sizeof(buf); c++)
+		buf[c] = '\0';
+	while (i < SETUP_SECTS * 512)
+	{
+		c = SETUP_SECTS * 512 - i;
+		if (c > sizeof(buf))
+			c = sizeof(buf);
+
+		if (write(1, buf, c) != c)
+			die("Write call failed");
+		i += c;
+	}
+
+	if ((id = open(argv[3], O_RDONLY, 0)) < 0)
+		die("Unable to open 'system'");
+	for (i = 0; (c = read(id, buf, sizeof(buf))) > 0; i += c)
+		if (write(1, buf, c) != c)
+			die("Write call failed");
+	close(id);
+	fprintf(stderr, "System is %d bytes.\n", i);
+	if (i > SYS_SIZE * 16)
+		die("System is too big");
+
+	return 0;
 }
